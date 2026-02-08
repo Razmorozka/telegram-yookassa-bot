@@ -124,11 +124,13 @@ def create_yookassa_payment(invoice_id: str, amount: Decimal, description: str, 
         "receipt": {
             "customer": {"email": email},
             "items": [
-                {
-                    "description": description,
-                    "quantity": "1.00",
-                    "amount": {"value": f"{amount:.2f}", "currency": "RUB"},
-                    "vat_code": 1,
+    {
+        "description": description,
+        "quantity": "1.00",
+        "amount": {"value": f"{amount:.2f}", "currency": "RUB"},
+        "vat_code": 1,
+        "payment_subject": "service",
+        "payment_mode": "full_payment",
                 }
             ],
         },
