@@ -2,15 +2,16 @@ import os
 import time
 import uuid
 from decimal import Decimal
-from typing import Dict, Any, Optional
+from typing import Dict, Any
 
 import requests
-from fastapi import FastAPI, Request, HTTPException
+from fastapi import FastAPI, Request
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import CommandStart
 from aiogram.types import Message, CallbackQuery
 from aiogram.utils.keyboard import InlineKeyboardBuilder
+
 
 # ---------------- ENV ----------------
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -20,6 +21,10 @@ GROUP_ID = int(os.getenv("GROUP_ID", "0"))
 YOOKASSA_SHOP_ID = os.getenv("YOOKASSA_SHOP_ID")
 YOOKASSA_SECRET_KEY = os.getenv("YOOKASSA_SECRET_KEY")
 
+# Админ для сопровождения
+ADMIN_USERNAME = "kairos_007"  # без @
+
+
 # ---------------- Basic checks ----------------
 if not BOT_TOKEN or not PUBLIC_BASE_URL:
     raise RuntimeError("Нужно задать BOT_TOKEN и PUBLIC_BASE_URL в ENV")
@@ -28,21 +33,36 @@ if not GROUP_ID:
 if not YOOKASSA_SHOP_ID or not YOOKASSA_SECRET_KEY:
     raise RuntimeError("Нужно задать YOOKASSA_SHOP_ID и YOOKASSA_SECRET_KEY в ENV")
 
+
 # ---------------- Bot/App ----------------
 bot = Bot(BOT_TOKEN)
 dp = Dispatcher()
 app = FastAPI()
 
+
 # ---------------- In-memory storage (для простоты) ----------------
-# Для продакшна лучше Postgres, но “самое простое” — так.
-USERS: Dict[int, Dict[str, Any]] = {}     # user_id -> {"step":..., "name":..., "email":...}
+USERS: Dict[int, Dict[str, Any]] = {}     # user_id -> {"step":..., "name":..., "email":..., "last_invoice_id":...}
 ORDERS: Dict[str, Dict[str, Any]] = {}    # invoice_id -> {"user_id":..., "plan":..., "amount":..., "payment_id":..., "status":...}
 
-# Пакеты — поменяйте как нужно
+
 PLANS = {
-    "basic": {"title": "Базовый доступ", "amount": Decimal("2400.00")},
-    "pro": {"title": "Доступ с сопровождением", "amount": Decimal("5400.00")},
+    "basic": {
+        "title": "Войти в закрытую группу",
+        "amount": Decimal("2400.00"),
+        "description": 'Доступ к материалам "Самодисциплина без стресса"',
+    },
+    "pro": {
+        "title": "С сопровождением",
+        "amount": Decimal("5400.00"),
+        "description": 'Доступ к материалам "Самодисциплина без стресса" с сопровождением',
+    },
+    "test": {
+        "title": "🧪 Вход за 1 ₽ (тест)",
+        "amount": Decimal("1.00"),
+        "description": 'ТЕСТОВЫЙ ДОСТУП: материалы "Самодисциплина без стресса"',
+    },
 }
+
 
 # ---------------- UI keyboards ----------------
 def kb_main():
@@ -52,6 +72,7 @@ def kb_main():
     kb.adjust(1)
     return kb.as_markup()
 
+
 def kb_plans():
     kb = InlineKeyboardBuilder()
     for plan_id, p in PLANS.items():
@@ -60,22 +81,33 @@ def kb_plans():
     kb.adjust(1)
     return kb.as_markup()
 
-def kb_pay(payment_url: str):
+
+def kb_pay(payment_url: str, plan_id: str):
     kb = InlineKeyboardBuilder()
     kb.button(text="💳 Перейти к оплате", url=payment_url)
+
+    # Для пакета сопровождения — кнопка написать админу
+    if plan_id == "pro":
+        kb.button(text="📩 Написать админу", url=f"https://t.me/{ADMIN_USERNAME}")
+
+    # На случай: оплата прошла, а ссылка потерялась
+    kb.button(text="🔁 Получить ссылку ещё раз", callback_data="resend_link")
+
     kb.button(text="⬅️ Назад", callback_data="choose_plan")
     kb.adjust(1)
     return kb.as_markup()
+
 
 # ---------------- YooKassa helpers ----------------
 def yk_auth():
     # BasicAuth: shopId:secretKey
     return (YOOKASSA_SHOP_ID, YOOKASSA_SECRET_KEY)
 
+
 def create_yookassa_payment(invoice_id: str, amount: Decimal, description: str, email: str) -> Dict[str, Any]:
     """
     Создаём платеж в ЮKassa через POST /v3/payments.
-    ЮKassa вернёт confirmation.confirmation_url, куда направляем пользователя. :contentReference[oaicite:1]{index=1}
+    ЮKassa вернёт confirmation.confirmation_url, куда направляем пользователя.
     """
     url = "https://api.yookassa.ru/v3/payments"
     idempotence_key = str(uuid.uuid4())
@@ -85,14 +117,10 @@ def create_yookassa_payment(invoice_id: str, amount: Decimal, description: str, 
         "capture": True,
         "confirmation": {
             "type": "redirect",
-            # куда ЮKassa вернёт пользователя после оплаты
             "return_url": f"{PUBLIC_BASE_URL}/return/{invoice_id}",
         },
         "description": description,
-        # Очень важно: metadata — чтобы в webhook достать invoice_id и user_id
         "metadata": {"invoice_id": invoice_id},
-        # Для чека email можно передать через receipt (зависит от ваших настроек онлайн-кассы/54-ФЗ)
-        # Если чек у вас формируется на стороне ЮKassa/партнёра — оставьте receipt.
         "receipt": {
             "customer": {"email": email},
             "items": [
@@ -116,12 +144,14 @@ def create_yookassa_payment(invoice_id: str, amount: Decimal, description: str, 
         raise RuntimeError(f"YooKassa create payment error: {r.status_code} {r.text}")
     return r.json()
 
+
 def get_yookassa_payment(payment_id: str) -> Dict[str, Any]:
     url = f"https://api.yookassa.ru/v3/payments/{payment_id}"
     r = requests.get(url, auth=yk_auth(), timeout=20)
     if r.status_code != 200:
         raise RuntimeError(f"YooKassa get payment error: {r.status_code} {r.text}")
     return r.json()
+
 
 # ---------------- Telegram handlers ----------------
 @dp.message(CommandStart())
@@ -131,6 +161,7 @@ async def start(message: Message):
         "Привет! 🙂\nЯ помогу оформить доступ в закрытую группу.\n\n"
         "Как тебя зовут?"
     )
+
 
 @dp.message()
 async def collect(message: Message):
@@ -168,10 +199,12 @@ async def collect(message: Message):
 
     await message.answer("Выбирай действие кнопками ниже 🙂", reply_markup=kb_main())
 
+
 @dp.callback_query(F.data == "choose_plan")
 async def choose_plan(cb: CallbackQuery):
     await cb.message.edit_text("Выберите пакет:", reply_markup=kb_plans())
     await cb.answer()
+
 
 @dp.callback_query(F.data.startswith("plan:"))
 async def plan(cb: CallbackQuery):
@@ -190,6 +223,7 @@ async def plan(cb: CallbackQuery):
     invoice_id = f"inv_{uid}_{int(time.time())}"
     amount = PLANS[plan_id]["amount"]
     title = PLANS[plan_id]["title"]
+    yk_description = PLANS[plan_id].get("description") or f"Доступ: {title}"
 
     ORDERS[invoice_id] = {
         "user_id": uid,
@@ -197,16 +231,20 @@ async def plan(cb: CallbackQuery):
         "amount": str(amount),
         "status": "created",
         "payment_id": None,
+        "created_at": int(time.time()),
     }
+    USERS.setdefault(uid, {})["last_invoice_id"] = invoice_id
 
     try:
         payment = create_yookassa_payment(
             invoice_id=invoice_id,
             amount=amount,
-            description=f"Доступ к курсу: {title}",
+            description=yk_description,
             email=user["email"],
         )
-    except Exception:
+    except Exception as e:
+        # важно для отладки: смотри Railway Logs
+        print("YOOKASSA_CREATE_ERROR:", str(e))
         await cb.answer("Не получилось создать оплату. Попробуйте позже.", show_alert=True)
         return
 
@@ -214,6 +252,7 @@ async def plan(cb: CallbackQuery):
     confirmation_url = (payment.get("confirmation") or {}).get("confirmation_url")
 
     if not payment_id or not confirmation_url:
+        print("YOOKASSA_CREATE_ERROR: bad response:", payment)
         await cb.answer("Проблема с оплатой. Напишите в поддержку.", show_alert=True)
         return
 
@@ -221,25 +260,53 @@ async def plan(cb: CallbackQuery):
     ORDERS[invoice_id]["status"] = "pending"
 
     await cb.message.edit_text(
-        f"Пакет: {title}\nСумма: {amount} ₽\n\n"
+        f"Пакет: {title}\n"
+        f"Сумма: {amount} ₽\n\n"
         "Нажмите кнопку ниже, оплатите, и я сразу пришлю ссылку в закрытую группу ✅",
-        reply_markup=kb_pay(confirmation_url),
+        reply_markup=kb_pay(confirmation_url, plan_id),
     )
     await cb.answer()
+
+
+@dp.callback_query(F.data == "resend_link")
+async def resend_link(cb: CallbackQuery):
+    uid = cb.from_user.id
+    last_invoice_id = USERS.get(uid, {}).get("last_invoice_id")
+
+    if not last_invoice_id or last_invoice_id not in ORDERS:
+        await cb.answer("Не вижу у вас заказа. Нажмите «Выбрать пакет».", show_alert=True)
+        return
+
+    order = ORDERS[last_invoice_id]
+    if order.get("status") != "paid":
+        await cb.answer("Ссылка появится после успешной оплаты 🙂", show_alert=True)
+        return
+
+    link = await issue_one_time_invite()
+    await cb.message.answer(
+    "Вот ваша персональная ссылка для входа в закрытую группу.\n"
+    "Ссылка одноразовая и действует 24 часа.\n\n"
+    "Если вы покупали доступ для ребёнка, пожалуйста, не входите сами — просто перешлите ссылку ребёнку:\n"
+    f"{link}"
+)
+    await cb.answer("Отправил ✅")
+
 
 @dp.callback_query(F.data == "support")
 async def support(cb: CallbackQuery):
     await cb.answer()
     await cb.message.edit_text(
-        "Поддержка: напишите @your_support\n\n"
+        f"Поддержка: напишите @{ADMIN_USERNAME}\n\n"
         "Если оплата прошла, а ссылки нет — просто пришлите email и время оплаты 🙂",
         reply_markup=kb_main()
     )
+
 
 @dp.callback_query(F.data == "back")
 async def back(cb: CallbackQuery):
     await cb.answer()
     await cb.message.edit_text("Выбирай действие:", reply_markup=kb_main())
+
 
 async def issue_one_time_invite() -> str:
     expire_date = int(time.time()) + 24 * 3600
@@ -249,6 +316,7 @@ async def issue_one_time_invite() -> str:
         expire_date=expire_date,
     )
     return invite.invite_link
+
 
 async def grant_access_by_invoice(invoice_id: str):
     order = ORDERS.get(invoice_id)
@@ -260,18 +328,27 @@ async def grant_access_by_invoice(invoice_id: str):
 
     uid = order["user_id"]
     await bot.send_message(
-        uid,
-        "Оплата подтверждена ✅\n\n"
-        "Вот персональная ссылка для входа в закрытую группу (одноразовая, действует 24 часа):\n"
-        f"{link}"
-    )
+    uid,
+    "Оплата подтверждена ✅\n\n"
+    "Вот ваша персональная ссылка для входа в закрытую группу.\n"
+    "Ссылка одноразовая и действует 24 часа.\n\n"
+    "Если вы покупали доступ для ребёнка, пожалуйста, не входите сами — просто перешлите ссылку ребёнку:\n"
+    f"{link}"
+)
+
 
 # ---------------- Webhooks ----------------
+@app.get("/")
+async def root():
+    return {"status": "ok"}
+
+
 @app.post("/telegram/webhook")
 async def telegram_webhook(request: Request):
     update = await request.json()
     await dp.feed_raw_update(bot, update)
     return {"ok": True}
+
 
 @app.post("/webhook/yookassa")
 async def yookassa_webhook(request: Request):
@@ -289,11 +366,10 @@ async def yookassa_webhook(request: Request):
     if not payment_id:
         return {"ok": True}
 
-    # Проверяем реальный статус в ЮKassa
     try:
         payment = get_yookassa_payment(payment_id)
-    except Exception:
-        # на всякий случай не падаем — ЮKassa может ретраить
+    except Exception as e:
+        print("YOOKASSA_GET_ERROR:", str(e))
         return {"ok": True}
 
     status = payment.get("status")
@@ -305,13 +381,15 @@ async def yookassa_webhook(request: Request):
 
     return {"ok": True}
 
+
 @app.get("/return/{invoice_id}")
 async def return_page(invoice_id: str):
-    # Страница “вы вернулись после оплаты”
-    # Здесь можно сделать простую заглушку
-    return {"message": "Спасибо! Если оплата прошла, бот пришлёт ссылку в течение минуты.", "invoice_id": invoice_id}
+    return {
+        "message": "Спасибо! Если оплата прошла, бот пришлёт ссылку в течение минуты.",
+        "invoice_id": invoice_id
+    }
+
 
 @app.on_event("startup")
 async def on_startup():
-    # Ставим вебхук Телеграм
     await bot.set_webhook(f"{PUBLIC_BASE_URL}/telegram/webhook")
