@@ -8,7 +8,7 @@ import requests
 from fastapi import FastAPI, Request
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import CommandStart, Command
-from aiogram.types import Message, CallbackQuery
+from aiogram.types import Message, CallbackQuery, ChatMemberUpdated
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 # ---------------- ENV ----------------
@@ -22,9 +22,8 @@ except:
 YOOKASSA_SHOP_ID = os.getenv("YOOKASSA_SHOP_ID")
 YOOKASSA_SECRET_KEY = os.getenv("YOOKASSA_SECRET_KEY")
 
-# Контакты
-ADMIN_USERNAME = "kairos_007" # Тех. поддержка
-EXPERT_USERNAME = "Liya_Sharova" # Лия (Эксперт)
+ADMIN_USERNAME = "kairos_007"
+EXPERT_USERNAME = "Liya_Sharova"
 SECRET_WORD = "лапки-лапки"
 
 # ---------------- DB ----------------
@@ -48,10 +47,10 @@ def db_get_user(user_id: int):
         return {"user_id": row[0], "name": row[1], "email": row[2], "step": row[3], "last_invoice_id": row[4]} if row else None
 
 def db_upsert_user(user_id: int, **kwargs):
-    current = db_get_user(user_id) or {}
-    data = {**current, "user_id": user_id, **kwargs}
+    current = db_get_user(user_id) or {"user_id": user_id, "name": None, "email": None, "step": None, "last_invoice_id": None}
+    for key, value in kwargs.items(): current[key] = value
     with sqlite3.connect(DB_FILE) as conn:
-        conn.execute("INSERT OR REPLACE INTO users VALUES (:user_id, :name, :email, :step, :last_invoice_id)", data)
+        conn.execute("INSERT OR REPLACE INTO users VALUES (:user_id, :name, :email, :step, :last_invoice_id)", current)
 
 def db_create_order(invoice_id, user_id, plan_id, amount, status, payment_id):
     with sqlite3.connect(DB_FILE) as conn:
@@ -70,22 +69,27 @@ def db_update_order_status(invoice_id: str, status: str):
 # ---------------- Настройки ----------------
 PLANS = {
     "test": {"title": "🧪 Тест за 1 ₽", "amount": Decimal("1.00"), "description": "Тестовый доступ"},
-    "basic": {"title": "Войти в группу", "amount": Decimal("2400.00"), "description": 'Доступ к материалам "Самодисциплина без стресса"'},
-    "pro": {"title": "С сопровождением", "amount": Decimal("5400.00"), "description": 'Материалы + личное сопровождение Лии Шаровой'}
+    "basic": {"title": "Войти в группу", "amount": Decimal("2400.00"), "description": "Доступ к материалам"},
+    "pro": {"title": "С сопровождением", "amount": Decimal("5400.00"), "description": "Материалы + Лия Шарова"}
 }
 
 bot = Bot(BOT_TOKEN)
 dp = Dispatcher()
 app = FastAPI()
 
-# ---------------- Клавиатуры ----------------
+# ---------------- Клавиатуры (Явные) ----------------
 def kb_main():
-    return InlineKeyboardBuilder().button(text="✅ Выбрать пакет", callback_data="choose_plan").button(text="❓ Поддержка", callback_data="support").adjust(1).as_markup()
+    kb = InlineKeyboardBuilder()
+    kb.button(text="✅ Выбрать пакет", callback_data="choose_plan")
+    kb.button(text="❓ Поддержка", callback_data="support")
+    return kb.adjust(1).as_markup()
 
 def kb_plans():
     kb = InlineKeyboardBuilder()
-    for pid, p in PLANS.items(): kb.button(text=f"{p['title']} — {p['amount']} ₽", callback_data=f"plan:{pid}")
-    return kb.button(text="⬅️ Назад", callback_data="back").adjust(1).as_markup()
+    for pid, p in PLANS.items():
+        kb.button(text=f"{p['title']} — {p['amount']} ₽", callback_data=f"plan:{pid}")
+    kb.button(text="⬅️ Назад", callback_data="back")
+    return kb.adjust(1).as_markup()
 
 def kb_pay(url, inv_id):
     kb = InlineKeyboardBuilder()
@@ -94,117 +98,114 @@ def kb_pay(url, inv_id):
     kb.button(text="📩 Тех. поддержка", url=f"https://t.me/{ADMIN_USERNAME}")
     return kb.adjust(1).as_markup()
 
-# ---------------- Логика выдачи ----------------
+# ---------------- Логика ----------------
 async def issue_link():
     try:
-        res = await bot.create_chat_invite_link(chat_id=GROUP_ID, member_limit=1)
+        # Ссылка живет 24 часа (86400 секунд)
+        expire_at = int(time.time()) + 86400
+        res = await bot.create_chat_invite_link(chat_id=GROUP_ID, member_limit=1, expire_date=expire_at)
         return res.invite_link
     except Exception as e: return f"Ошибка API: {str(e)}"
 
 async def grant_access(inv_id):
     order = db_get_order(inv_id)
     if not order or order["status"] == "paid": return
-    db_update_order_status(inv_id, "paid")
     
+    # Двойная проверка через API ЮKassa для безопасности
+    r = requests.get(f"https://api.yookassa.ru/v3/payments/{order['payment_id']}", auth=(YOOKASSA_SHOP_ID, YOOKASSA_SECRET_KEY)).json()
+    if r.get("status") != "succeeded": return
+
+    db_update_order_status(inv_id, "paid")
     user = db_get_user(order["user_id"])
     link = await issue_link()
     name = user.get("name", "Друг")
-    plan_id = order.get("plan_id")
-
-    if not link.startswith("https"):
-        await bot.send_message(order["user_id"], f"✅ Оплата подтверждена! Заказ `{inv_id}`. Но возникла ошибка ссылки: {link}. Напишите @{ADMIN_USERNAME}")
-        return
-
-    # Формируем сообщение для пересылки
+    
     msg = (
         f"Ура, {name}! 🎉 Оплата подтверждена.\n"
         f"🆔 Номер заказа: `{inv_id}`\n\n"
         f"⬇️ **ПЕРЕШЛИТЕ ЭТО СООБЩЕНИЕ РЕБЕНКУ** ⬇️\n\n"
         f"Привет! Твой доступ к курсу готов:\n"
-        f"1️⃣ Вступай в закрытую группу: {link}\n"
+        f"1️⃣ Вступай в группу: {link}\n"
     )
-
-    # Если PRO или ТЕСТ — добавляем сопровождение
-    if plan_id in ["pro", "test"]:
+    if order["plan_id"] in ["pro", "test"]:
         msg += (
-            f"2️⃣ Твой пакет включает **личное сопровождение**.\n"
-            f"Напиши эксперту Лие Шаровой: @{EXPERT_USERNAME}\n"
-            f"Отправь ей секретное слово: `{SECRET_WORD}`\n"
-            f"И свой номер заказа: `{inv_id}`\n"
+            f"2️⃣ У тебя пакет с сопровождением!\n"
+            f"Напиши Лие Шаровой: @{EXPERT_USERNAME}\n"
+            f"Отправь секретное слово: `{SECRET_WORD}`\n"
+            f"И номер заказа: `{inv_id}`\n"
         )
-    
-    msg += "\n⚠️ Ссылка одноразовая и действует 24 часа. До встречи!"
-
+    msg += "\n⚠️ Ссылка действует 24 часа."
     await bot.send_message(order["user_id"], msg)
 
-async def reminder_task(inv_id):
-    await asyncio.sleep(3600)
-    order = db_get_order(inv_id)
-    if order and order["status"] == "pending":
-        try: await bot.send_message(order["user_id"], "Заметили, что вы не завершили оплату. 😊\nНужна помощь? Пишите @{ADMIN_USERNAME}")
-        except: pass
-
 # ---------------- Handlers ----------------
-
 @dp.message(CommandStart())
 async def start(m: Message):
-    # Принудительно сбрасываем шаг на "name", чтобы пользователь мог пройти путь заново
     db_upsert_user(m.from_user.id, name=m.from_user.first_name, step="name")
-    await m.answer(
-        f"Привет! 🙂 Я помогу оформить доступ в закрытую группу.\n\n"
-        f"Как мне лучше к тебе обращаться? Напиши своё имя:"
-    )
-
-# Приветствие в группе (когда ребенок заходит по ссылке)
-@dp.chat_member()
-async def welcome_new_member(chat_member: Message):
-    if chat_member.new_chat_member.status == "member":
-        await bot.send_message(
-            chat_member.chat.id,
-            f"Добро пожаловать в группу! 👋\n\n"
-            f"Обязательно изучи правила в закрепленном сообщении. "
-            f"Если у тебя пакет с сопровождением — не забудь написать Лие Шаровой!"
-        )
+    await m.answer(f"Привет! 🙂 Как тебя зовут?")
 
 @dp.message(Command("test_link"))
-async def test(m: Message):
-    await m.answer(f"Тест ссылки: {await issue_link()}")
-
-@dp.message(Command("broadcast"))
-async def broadcast(m: Message):
-    if m.from_user.username != ADMIN_USERNAME: return
-    text = m.text.replace("/broadcast", "").strip()
-    if not text: return await m.answer("Введите текст")
-    users = db_get_all_users()
-    count = 0
-    for uid in users:
-        try:
-            await bot.send_message(uid, text)
-            count += 1
-            await asyncio.sleep(0.05)
-        except: continue
-    await m.answer(f"📢 Рассылка завершена. Получили {count} чел.")
+async def test_cmd(m: Message):
+    await m.answer(f"Тест (на 24ч): {await issue_link()}")
 
 @dp.message()
 async def flow(m: Message):
-    # Если это сообщение в группе, бот его игнорирует
-    if m.chat.type in ["group", "supergroup"]:
-        return
-
+    if m.chat.type in ["group", "supergroup"]: return
     u = db_get_user(m.from_user.id)
     if not u: return
-    
     if u["step"] == "name":
         db_upsert_user(m.from_user.id, name=m.text, step="email")
-        await m.answer(f"Приятно познакомиться, {m.text}! 😊 Теперь укажи свой email для получения чека:")
+        await m.answer(f"Приятно познакомиться! 😊 Теперь укажи email:")
     elif u["step"] == "email":
-        if "@" not in m.text: 
-            return await m.answer("Введи, пожалуйста, корректный email (например: mail@example.com)")
+        if "@" not in m.text: return await m.answer("Введи корректный email")
         db_upsert_user(m.from_user.id, email=m.text, step="done")
-        await m.answer(f"Всё готово! Теперь выбери подходящий пакет участия:", reply_markup=kb_main())
-    else:
-        # Если шаг уже "done", и пользователь просто пишет текст, напоминаем про кнопки
-        await m.answer("Пожалуйста, воспользуйся кнопками в меню выше или нажми /start, если хочешь начать заново.")
+        await m.answer("Выбирай пакет:", reply_markup=kb_main())
+
+@dp.callback_query(F.data == "choose_plan")
+async def plans_cb(cb: CallbackQuery): await cb.message.edit_text("Пакеты:", reply_markup=kb_plans())
+
+@dp.callback_query(F.data.startswith("plan:"))
+async def pay_cb(cb: CallbackQuery):
+    pid = cb.data.split(":")[1]
+    u = db_get_user(cb.from_user.id)
+    inv_id = f"inv_{cb.from_user.id}_{int(time.time())}"
+    try:
+        res = requests.post(
+            "https://api.yookassa.ru/v3/payments",
+            auth=(YOOKASSA_SHOP_ID, YOOKASSA_SECRET_KEY),
+            headers={"Idempotence-Key": str(uuid.uuid4()), "Content-Type": "application/json"},
+            json={
+                "amount": {"value": f"{PLANS[pid]['amount']:.2f}", "currency": "RUB"},
+                "capture": True,
+                "confirmation": {"type": "redirect", "return_url": f"{PUBLIC_BASE_URL}/return/{inv_id}"},
+                "description": PLANS[pid]["description"],
+                "metadata": {"invoice_id": inv_id},
+                "receipt": {
+                    "customer": {"email": u["email"]},
+                    "items": [{
+                        "description": PLANS[pid]["description"],
+                        "quantity": "1.00",
+                        "amount": {"value": f"{PLANS[pid]['amount']:.2f}", "currency": "RUB"},
+                        "vat_code": 1,
+                        "payment_subject": "service" # Тот самый важный параметр
+                    }]
+                }
+            }
+        ).json()
+        db_create_order(inv_id, cb.from_user.id, pid, PLANS[pid]["amount"], "pending", res["id"])
+        await cb.message.edit_text(f"К оплате: {PLANS[pid]['amount']} ₽", reply_markup=kb_pay(res["confirmation"]["confirmation_url"], inv_id))
+    except: await cb.answer("Ошибка связи с банком.", show_alert=True)
+
+@dp.callback_query(F.data.startswith("check:"))
+async def check_cb(cb: CallbackQuery):
+    await grant_access(cb.data.split(":")[1])
+    order = db_get_order(cb.data.split(":")[1])
+    if order["status"] != "paid": await cb.answer("Оплата пока не прошла ⏳", show_alert=True)
+
+@dp.callback_query(F.data == "support")
+async def supp_cb(cb: CallbackQuery): await cb.message.answer(f"Поддержка: @{ADMIN_USERNAME}")
+
+@dp.callback_query(F.data == "back")
+async def back_cb(cb: CallbackQuery): await cb.message.edit_text("Меню:", reply_markup=kb_main())
 
 # ---------------- Webhooks ----------------
 @app.post("/telegram/webhook")
@@ -217,7 +218,7 @@ async def yk_wh(r: Request):
     d = await r.json()
     if d.get("event") == "payment.succeeded":
         inv = d["object"].get("metadata", {}).get("invoice_id")
-        if inv: await grant_access(inv)
+        if inv: await grant_access(inv) # Тут внутри теперь есть проверка через API
     return {"ok": True}
 
 @app.on_event("startup")
