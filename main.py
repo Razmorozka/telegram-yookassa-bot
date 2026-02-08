@@ -145,10 +145,26 @@ async def reminder_task(inv_id):
         except: pass
 
 # ---------------- Handlers ----------------
+
 @dp.message(CommandStart())
 async def start(m: Message):
-    db_upsert_user(m.from_user.id, step="name")
-    await m.answer("Привет! 🙂 Я помогу попасть в закрытую группу.\n\nКак тебя зовут?")
+    # Принудительно сбрасываем шаг на "name", чтобы пользователь мог пройти путь заново
+    db_upsert_user(m.from_user.id, name=m.from_user.first_name, step="name")
+    await m.answer(
+        f"Привет! 🙂 Я помогу оформить доступ в закрытую группу.\n\n"
+        f"Как мне лучше к тебе обращаться? Напиши своё имя:"
+    )
+
+# Приветствие в группе (когда ребенок заходит по ссылке)
+@dp.chat_member()
+async def welcome_new_member(chat_member: Message):
+    if chat_member.new_chat_member.status == "member":
+        await bot.send_message(
+            chat_member.chat.id,
+            f"Добро пожаловать в группу! 👋\n\n"
+            f"Обязательно изучи правила в закрепленном сообщении. "
+            f"Если у тебя пакет с сопровождением — не забудь написать Лие Шаровой!"
+        )
 
 @dp.message(Command("test_link"))
 async def test(m: Message):
@@ -171,59 +187,24 @@ async def broadcast(m: Message):
 
 @dp.message()
 async def flow(m: Message):
+    # Если это сообщение в группе, бот его игнорирует
+    if m.chat.type in ["group", "supergroup"]:
+        return
+
     u = db_get_user(m.from_user.id)
     if not u: return
+    
     if u["step"] == "name":
         db_upsert_user(m.from_user.id, name=m.text, step="email")
-        await m.answer(f"Приятно познакомиться, {m.text}! 😊 Теперь укажи email:")
+        await m.answer(f"Приятно познакомиться, {m.text}! 😊 Теперь укажи свой email для получения чека:")
     elif u["step"] == "email":
-        if "@" not in m.text: return await m.answer("Введи корректный email")
+        if "@" not in m.text: 
+            return await m.answer("Введи, пожалуйста, корректный email (например: mail@example.com)")
         db_upsert_user(m.from_user.id, email=m.text, step="done")
-        await m.answer(f"Готово! Выбирай пакет:", reply_markup=kb_main())
-
-@dp.callback_query(F.data == "choose_plan")
-async def plans_cb(cb: CallbackQuery): await cb.message.edit_text("Пакеты:", reply_markup=kb_plans())
-
-@dp.callback_query(F.data.startswith("plan:"))
-async def pay_cb(cb: CallbackQuery):
-    pid = cb.data.split(":")[1]
-    u = db_get_user(cb.from_user.id)
-    inv_id = f"inv_{cb.from_user.id}_{int(time.time())}"
-    
-    try:
-        res = requests.post(
-            "https://api.yookassa.ru/v3/payments",
-            auth=(YOOKASSA_SHOP_ID, YOOKASSA_SECRET_KEY),
-            headers={"Idempotence-Key": str(uuid.uuid4()), "Content-Type": "application/json"},
-            json={
-                "amount": {"value": f"{PLANS[pid]['amount']:.2f}", "currency": "RUB"},
-                "capture": True,
-                "confirmation": {"type": "redirect", "return_url": f"{PUBLIC_BASE_URL}/return/{inv_id}"},
-                "description": PLANS[pid]["description"],
-                "metadata": {"invoice_id": inv_id},
-                "receipt": {"customer": {"email": u["email"]}, "items": [{"description": PLANS[pid]["description"], "quantity": "1.00", "amount": {"value": f"{PLANS[pid]['amount']:.2f}", "currency": "RUB"}, "vat_code": 1}]}
-            }
-        ).json()
-        
-        db_create_order(inv_id, cb.from_user.id, pid, PLANS[pid]["amount"], "pending", res["id"])
-        asyncio.create_task(reminder_task(inv_id))
-        await cb.message.edit_text(f"{u['name']}, К оплате: {PLANS[pid]['amount']} ₽", reply_markup=kb_pay(res["confirmation"]["confirmation_url"], inv_id))
-    except Exception as e:
-        await cb.answer("Ошибка связи с банком. Попробуйте позже.", show_alert=True)
-
-@dp.callback_query(F.data.startswith("check:"))
-async def check_cb(cb: CallbackQuery):
-    oid = cb.data.split(":")[1]
-    order = db_get_order(oid)
-    r = requests.get(f"https://api.yookassa.ru/v3/payments/{order['payment_id']}", auth=(YOOKASSA_SHOP_ID, YOOKASSA_SECRET_KEY)).json()
-    if r.get("status") == "succeeded": await grant_access(oid)
-    else: await cb.answer("Оплата еще не дошла ⏳", show_alert=True)
-
-@dp.callback_query(F.data == "support")
-async def supp_cb(cb: CallbackQuery): await cb.message.answer(f"Тех. поддержка: @{ADMIN_USERNAME}")
-
-@dp.callback_query(F.data == "back")
-async def back_cb(cb: CallbackQuery): await cb.message.edit_text("Меню:", reply_markup=kb_main())
+        await m.answer(f"Всё готово! Теперь выбери подходящий пакет участия:", reply_markup=kb_main())
+    else:
+        # Если шаг уже "done", и пользователь просто пишет текст, напоминаем про кнопки
+        await m.answer("Пожалуйста, воспользуйся кнопками в меню выше или нажми /start, если хочешь начать заново.")
 
 # ---------------- Webhooks ----------------
 @app.post("/telegram/webhook")
