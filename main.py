@@ -163,6 +163,8 @@ def kb_main():
 def kb_plans():
     kb = InlineKeyboardBuilder()
     for pid, p in PLANS.items():
+        if pid == "test":
+            continue  # ✅ скрываем тестовый пакет (не удаляя из кода)
         kb.button(text=f"{p['title']} — {p['amount']} ₽", callback_data=f"plan:{pid}")
     kb.button(text="⬅️ Назад", callback_data="back")
     kb.adjust(1)
@@ -278,6 +280,10 @@ async def reminder_task(inv_id: str):
 # ---------------- Handlers ----------------
 @dp.message(CommandStart())
 async def start(m: Message):
+    # ✅ в группах /start не обрабатываем (чтобы в группе не триггерилось)
+    if m.chat.type in ["group", "supergroup"]:
+        return
+
     u = db_get_user(m.from_user.id)
 
     # ✅ Если пользователь уже зарегистрирован — НЕ спрашиваем заново
@@ -290,6 +296,21 @@ async def start(m: Message):
     db_upsert_user(m.from_user.id, name=None, email=None, step="name", last_invoice_id=None)
     await m.answer("Привет! 🙂 Я помогу оформить доступ в закрытую группу.\n\nКак тебя зовут?")
 
+# ✅ Приветствие в группе (самый стабильный вариант)
+@dp.message(F.new_chat_members)
+async def welcome_new_members_message(m: Message):
+    if m.chat.id != GROUP_ID:
+        return
+    try:
+        await m.answer(
+            "Добро пожаловать в группу! 👋\n\n"
+            "Изучи правила в закреплённом сообщении.\n"
+            "Если у тебя пакет с сопровождением — напиши эксперту."
+        )
+    except Exception:
+        pass
+
+# (оставляем как было — пусть живёт, не ломаем)
 @dp.chat_member()
 async def welcome_new_member(event: ChatMemberUpdated):
     if event.new_chat_member.status == "member":
@@ -303,6 +324,9 @@ async def welcome_new_member(event: ChatMemberUpdated):
 
 @dp.message(Command("test_link"))
 async def test_cmd(m: Message):
+    # ✅ в группах не реагируем
+    if m.chat.type in ["group", "supergroup"]:
+        return
     await m.answer(f"Тест генерации ссылки: {await issue_link()}")
 
 @dp.message()
