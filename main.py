@@ -40,8 +40,8 @@ ORDERS: Dict[str, Dict[str, Any]] = {}    # invoice_id -> {"user_id":..., "plan"
 
 # Пакеты — поменяйте как нужно
 PLANS = {
-    "basic": {"title": "Базовый доступ", "amount": Decimal("990.00")},
-    "pro": {"title": "Полный доступ", "amount": Decimal("1990.00")},
+    "basic": {"title": "Базовый доступ", "amount": Decimal("2400.00")},
+    "pro": {"title": "Доступ с сопровождением", "amount": Decimal("5400.00")},
 }
 
 # ---------------- UI keyboards ----------------
