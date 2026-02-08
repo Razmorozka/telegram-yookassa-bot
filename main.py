@@ -352,7 +352,9 @@ async def telegram_webhook(request: Request):
     return {"ok": True}
 
 
-@app.post("/webhook/yookassa")
+@app.get("/webhook/yookassa")
+async def yookassa_webhook_ping():
+    return {"ok": True, "hint": "use POST for real notifications"}
 async def yookassa_webhook(request: Request):
     """
     Надёжная проверка: не доверяем “на слово” входящему webhook,
