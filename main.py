@@ -82,18 +82,18 @@ def kb_plans():
     return kb.as_markup()
 
 
-def kb_pay(payment_url: str, plan_id: str):
+def kb_pay(payment_url: str, plan_id: str, invoice_id: str):
     kb = InlineKeyboardBuilder()
-    kb.button(text="💳 Перейти к оплате", url=payment_url)
 
-    # Для пакета сопровождения — кнопка написать админу
+    kb.button(text="💳 Перейти к оплате", url=payment_url)
+    kb.button(text="✅ Я оплатил — проверить", callback_data=f"check:{invoice_id}")
+
     if plan_id == "pro":
         kb.button(text="📩 Написать админу", url=f"https://t.me/{ADMIN_USERNAME}")
 
-    # На случай: оплата прошла, а ссылка потерялась
     kb.button(text="🔁 Получить ссылку ещё раз", callback_data="resend_link")
-
     kb.button(text="⬅️ Назад", callback_data="choose_plan")
+
     kb.adjust(1)
     return kb.as_markup()
 
