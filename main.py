@@ -199,7 +199,7 @@ async def collect(message: Message):
         )
         return
 
-    await message.answer("Выбирай действие кнопками ниже 🙂", reply_markup=kb_main())
+        await message.answer("Выбирай действие кнопками ниже 🙂", reply_markup=kb_main())
 
 
 @dp.callback_query(F.data == "choose_plan")
@@ -245,7 +245,6 @@ async def plan(cb: CallbackQuery):
             email=user["email"],
         )
     except Exception as e:
-        # важно для отладки: смотри Railway Logs
         print("YOOKASSA_CREATE_ERROR:", str(e))
         await cb.answer("Не получилось создать оплату. Попробуйте позже.", show_alert=True)
         return
@@ -261,11 +260,16 @@ async def plan(cb: CallbackQuery):
     ORDERS[invoice_id]["payment_id"] = payment_id
     ORDERS[invoice_id]["status"] = "pending"
 
+    # ✅ Мягкая автопроверка оплаты (15 сек и 60 сек) — без спама
+    import asyncio
+    asyncio.create_task(auto_check_payment(invoice_id))
+
     await cb.message.edit_text(
         f"Пакет: {title}\n"
         f"Сумма: {amount} ₽\n\n"
-        "Нажмите кнопку ниже, оплатите, и я сразу пришлю ссылку в закрытую группу ✅",
-        reply_markup=kb_pay(confirmation_url, plan_id),
+        "Нажмите кнопку ниже, оплатите, и я пришлю ссылку в закрытую группу ✅\n\n"
+        "Если оплатили, а ссылка не пришла — нажмите «✅ Я оплатил — проверить».",
+        reply_markup=kb_pay(confirmation_url, plan_id, invoice_id),
     )
     await cb.answer()
 
@@ -286,12 +290,44 @@ async def resend_link(cb: CallbackQuery):
 
     link = await issue_one_time_invite()
     await cb.message.answer(
-    "Вот ваша персональная ссылка для входа в закрытую группу.\n"
-    "Ссылка одноразовая и действует 24 часа.\n\n"
-    "Если вы покупали доступ для ребёнка, пожалуйста, не входите сами — просто перешлите ссылку ребёнку:\n"
-    f"{link}"
-)
+        "Вот ваша персональная ссылка для входа в закрытую группу.\n"
+        "Ссылка одноразовая и действует 24 часа.\n\n"
+        "Если вы покупали доступ для ребёнка, пожалуйста, не входите сами — просто перешлите ссылку ребёнку:\n"
+        f"{link}"
+    )
     await cb.answer("Отправил ✅")
+
+
+@dp.callback_query(F.data.startswith("check:"))
+async def check_payment(cb: CallbackQuery):
+    invoice_id = cb.data.split(":", 1)[1]
+    order = ORDERS.get(invoice_id)
+    if not order:
+        await cb.answer("Заказ не найден.", show_alert=True)
+        return
+
+    payment_id = order.get("payment_id")
+    if not payment_id:
+        await cb.answer("Не вижу payment_id. Напишите в поддержку.", show_alert=True)
+        return
+
+    try:
+        payment = get_yookassa_payment(payment_id)
+    except Exception as e:
+        print("YOOKASSA_GET_ERROR:", str(e))
+        await cb.answer("Не получилось проверить оплату. Попробуйте ещё раз.", show_alert=True)
+        return
+
+    status = payment.get("status")
+    if status == "succeeded":
+        await grant_access_by_invoice(invoice_id)
+        await cb.answer("Оплата подтверждена ✅", show_alert=False)
+        return
+
+    await cb.answer(
+        f"Пока статус: {status}. Если вы только что оплатили — подождите минуту и нажмите ещё раз 🙂",
+        show_alert=True
+    )
 
 
 @dp.callback_query(F.data == "support")
@@ -299,7 +335,7 @@ async def support(cb: CallbackQuery):
     await cb.answer()
     await cb.message.edit_text(
         f"Поддержка: напишите @{ADMIN_USERNAME}\n\n"
-        "Если оплата прошла, а ссылки нет — просто пришлите email и время оплаты 🙂",
+        "Если оплата прошла, а ссылки нет — пришлите email и время оплаты 🙂",
         reply_markup=kb_main()
     )
 
@@ -330,13 +366,58 @@ async def grant_access_by_invoice(invoice_id: str):
 
     uid = order["user_id"]
     await bot.send_message(
-    uid,
-    "Оплата подтверждена ✅\n\n"
-    "Вот ваша персональная ссылка для входа в закрытую группу.\n"
-    "Ссылка одноразовая и действует 24 часа.\n\n"
-    "Если вы покупали доступ для ребёнка, пожалуйста, не входите сами — просто перешлите ссылку ребёнку:\n"
-    f"{link}"
-)
+        uid,
+        "Оплата подтверждена ✅\n\n"
+        "Вот ваша персональная ссылка для входа в закрытую группу.\n"
+        "Ссылка одноразовая и действует 24 часа.\n\n"
+        "Если вы покупали доступ для ребёнка, пожалуйста, не входите сами — просто перешлите ссылку ребёнку:\n"
+        f"{link}"
+    )
+
+
+async def auto_check_payment(invoice_id: str):
+    """
+    Мягкая автопроверка статуса оплаты:
+    2 проверки (через 15 сек и через 60 сек), максимум 1 сообщение пользователю.
+    """
+    import asyncio
+
+    order = ORDERS.get(invoice_id)
+    if not order:
+        return
+
+    uid = order["user_id"]
+    payment_id = order.get("payment_id")
+    if not payment_id:
+        return
+
+    for delay in (15, 60):
+        await asyncio.sleep(delay)
+
+        order = ORDERS.get(invoice_id)
+        if not order or order.get("status") == "paid":
+            return
+
+        try:
+            payment = get_yookassa_payment(payment_id)
+        except Exception as e:
+            print("AUTO_CHECK_GET_ERROR:", str(e))
+            continue
+
+        status = payment.get("status")
+        if status == "succeeded":
+            await grant_access_by_invoice(invoice_id)
+            return
+
+    # одно мягкое сообщение, если спустя минуту оплаты нет
+    order = ORDERS.get(invoice_id)
+    if order and order.get("status") != "paid":
+        await bot.send_message(
+            uid,
+            "Пока не вижу успешной оплаты.\n\n"
+            "Если вы уже оплатили — нажмите «✅ Я оплатил — проверить».\n"
+            "Если ещё нет — просто завершите оплату по кнопке «💳 Перейти к оплате» 🙂"
+        )
 
 
 # ---------------- Webhooks ----------------
@@ -352,16 +433,17 @@ async def telegram_webhook(request: Request):
     return {"ok": True}
 
 
+# ✅ Пинг для проверки доступности URL из интернета
 @app.get("/webhook/yookassa")
 async def yookassa_webhook_ping():
     return {"ok": True, "hint": "use POST for real notifications"}
+
+
+# ✅ Реальный webhook от ЮKassa
+@app.post("/webhook/yookassa")
 async def yookassa_webhook(request: Request):
-    """
-    Надёжная проверка: не доверяем “на слово” входящему webhook,
-    а берем payment_id из payload и запрашиваем payment в ЮKassa по API,
-    убеждаемся, что status == succeeded и metadata.invoice_id совпадает.
-    """
     payload = await request.json()
+    print("YOOKASSA_WEBHOOK_IN:", payload.get("event"))
 
     event = payload.get("event")
     obj = payload.get("object") or {}
@@ -397,3 +479,4 @@ async def return_page(invoice_id: str):
 @app.on_event("startup")
 async def on_startup():
     await bot.set_webhook(f"{PUBLIC_BASE_URL}/telegram/webhook")
+
